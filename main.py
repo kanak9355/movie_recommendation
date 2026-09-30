@@ -80,7 +80,7 @@ user_movies = user_movies.dropna()
 print("\nMovies already rated by User", user_id)
 print(user_movies)
 
-# Get the IDs of top 5 similar users
+# Get IDs of top 5 similar users
 top_users = similar_users.head(5).index
 
 # Get ratings given by these users

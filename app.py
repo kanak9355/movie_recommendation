@@ -16,31 +16,78 @@ import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 
 # --------------------------------------------------------------------------
-# 1. Settings - change only these lines when you test a different dataset
+# 1. Settings - the sample dataset's columns. For other datasets use the sidebar mapping.
 # --------------------------------------------------------------------------
 DATA_PATH = "data/Movie_Recommendation_System.xlsx"
 SHEET = "Movie_Data"
 
+# internal names (also the sample dataset's real column names)
 USER, TITLE, GENRE, LANG = "User_ID", "Movie_Title", "Genre", "Language"
 YEAR, RATING, RUNTIME = "Release_Year", "Rating", "Runtime_Minutes"
+
+REQUIRED = [USER, TITLE, RATING]
+OPTIONAL = [GENRE, LANG, YEAR, RUNTIME]
+LABELS = {USER: "Viewer / user ID", TITLE: "Movie title", RATING: "Rating", GENRE: "Genre",
+          LANG: "Language", YEAR: "Release year", RUNTIME: "Runtime (minutes)"}
+GUESS = {USER: ["user"], TITLE: ["title", "name", "movie"], RATING: ["rating", "score", "star"],
+         GENRE: ["genre", "category"], LANG: ["language", "lang"], YEAR: ["year"],
+         RUNTIME: ["runtime", "duration", "length"]}
 
 TOP_USERS = 5     # how many similar users ("taste twins") to look at
 TOP_MOVIES = 5    # how many movies to recommend
 
 
 # --------------------------------------------------------------------------
-# 2. Recommender (same logic as your notebook)
+# 2. Data + recommender (same logic as your notebook)
 # --------------------------------------------------------------------------
-def prepare(source):
-    """Clean data, build user x movie matrix and user-user cosine similarity."""
-    df = pd.read_excel(source, sheet_name=SHEET)
+def read_raw(src, filename, sheet):
+    if isinstance(src, bytes):
+        src = io.BytesIO(src)
+    if str(filename).lower().endswith(".csv"):
+        return pd.read_csv(src)
+    return pd.read_excel(src, sheet_name=sheet)
+
+
+def guess_column(columns, canon):
+    """Pick the most likely source column for an internal field."""
+    low = {c: str(c).lower() for c in columns}
+    for c in columns:                                    # exact match first
+        if low[c].replace(" ", "_") == canon.lower():
+            return c
+    bad = ("number", "count", "num", "total", "id")
+    for key in GUESS[canon]:
+        for c in columns:
+            if key in low[c] and not (canon in (RATING, TITLE) and any(b in low[c] for b in bad)):
+                return c
+    return None
+
+
+def prepare(raw, mapping):
+    """Clean data, build user x movie matrix and user-user cosine similarity.
+    mapping: internal field -> column name in the file (or None for optional fields)."""
+    used = {canon: src for canon, src in mapping.items() if src}
+    df = raw[list(used.values())].copy()
+    df.columns = list(used.keys())
+
+    if GENRE not in df: df[GENRE] = "Unknown"
+    if LANG not in df: df[LANG] = "Unknown"
+    if YEAR not in df: df[YEAR] = float("nan")
+    if RUNTIME not in df: df[RUNTIME] = float("nan")
 
     df[GENRE] = df[GENRE].fillna("Unknown")
     df[LANG] = df[LANG].fillna("Unknown")
-    df = df.dropna(subset=[RATING])
+    df[RATING] = pd.to_numeric(df[RATING], errors="coerce")
+    df[YEAR] = pd.to_numeric(df[YEAR], errors="coerce")
+    df[RUNTIME] = pd.to_numeric(df[RUNTIME], errors="coerce")
+    df = df.dropna(subset=[USER, TITLE, RATING])
+    df[TITLE] = df[TITLE].astype(str).str.strip()
     df = df.drop_duplicates(subset=[USER, TITLE])
+    if df.empty:
+        raise ValueError("No usable rows after cleaning - check that Rating is a number column.")
 
     matrix = df.pivot_table(index=USER, columns=TITLE, values=RATING, aggfunc="mean")
+    if len(matrix) < 2:
+        raise ValueError("Need at least 2 different users to find similar users.")
     sim = cosine_similarity(matrix.fillna(0))
     sim_df = pd.DataFrame(sim, index=matrix.index, columns=matrix.index)
 
@@ -49,7 +96,9 @@ def prepare(source):
         runtime=(RUNTIME, "mean"),
         year=(YEAR, "median"),
     )
-    return df, matrix, sim_df, meta
+    top = df[RATING].max()
+    scale = 5 if top <= 5 else 10 if top <= 10 else float(top)   # rating scale of this dataset
+    return df, matrix, sim_df, meta, scale
 
 
 def recommend(user_id, matrix, sim_df, k=TOP_USERS, n=TOP_MOVIES):
@@ -58,6 +107,7 @@ def recommend(user_id, matrix, sim_df, k=TOP_USERS, n=TOP_MOVIES):
     watched : Series  movie -> rating given by this user
     recs    : DataFrame index=movie, columns=score, backers
     """
+    k = min(k, len(sim_df) - 1)
     twins = sim_df[user_id].sort_values(ascending=False).drop(user_id).head(k)
     watched = matrix.loc[user_id].dropna()
 
@@ -90,7 +140,14 @@ CSS = """
     #0e0b0a;
 }
 .block-container{max-width:1060px; padding-top:2.2rem; padding-bottom:5rem;}
-.stApp p, .stApp label, .stApp span, .stApp li{font-family:'Jost',sans-serif;}
+.stApp p, .stApp label, .stApp li, .stApp .stMarkdown{font-family:'Jost',sans-serif;}
+/* keep Streamlit's own icons (upload, arrows, sidebar toggle) on their icon font */
+[data-testid="stIconMaterial"], span[class*="material-symbols"], span[class*="material-icons"]{
+  font-family:'Material Symbols Rounded','Material Icons'!important; font-weight:400!important; font-style:normal!important;
+  letter-spacing:normal!important; text-transform:none!important; font-feature-settings:'liga'!important;}
+section[data-testid="stSidebar"]{background:#120d0c; border-right:1px solid var(--gold-dim);}
+section[data-testid="stSidebar"] *{color:var(--ivory);}
+[data-testid="stFileUploaderDropzone"]{background:#17110f!important; border:1px dashed var(--gold-dim)!important; border-radius:2px!important;}
 
 /* ---------- curtain: the one entrance moment ---------- */
 .curtain{position:fixed; inset:0; z-index:99999; pointer-events:none; animation:cur-gone 0s 2.6s forwards;}
@@ -277,11 +334,17 @@ def poster_html(title, caption, numeral) -> str:
     </div>""")
 
 
+def na(x, fmt="{:.0f}") -> str:
+    return "n/a" if pd.isna(x) else fmt.format(x)
+
+
 def viewer_html(uid, df, watched) -> str:
     mine = df[df[USER] == uid]
     genre_avg = mine.groupby(GENRE)[RATING].mean().sort_values(ascending=False)
-    best_genre = genre_avg.index[0] if len(genre_avg) else "n/a"
-    fav_lang = mine[LANG].mode().iloc[0] if len(mine) else "n/a"
+    best_genre = genre_avg.index[0] if len(genre_avg) else "Unknown"
+    fav_lang = mine[LANG].mode().iloc[0] if len(mine) else "Unknown"
+    best_genre = "n/a" if best_genre == "Unknown" else best_genre
+    fav_lang = "n/a" if fav_lang == "Unknown" else fav_lang
     avg_given = f"{watched.mean():.1f}" if len(watched) else "n/a"
 
     seen = "".join(f"<span>{esc(t)}<i>{r:.1f}</i></span>" for t, r in watched.items())
@@ -296,7 +359,7 @@ def viewer_html(uid, df, watched) -> str:
     <div class="seen"><em>Already seen</em>{seen}</div>""")
 
 
-def feature_html(title, score, backers, meta) -> str:
+def feature_html(title, score, backers, meta, scale) -> str:
     m = meta.loc[title]
     return flat(f"""
     <div class="feature">
@@ -306,24 +369,24 @@ def feature_html(title, score, backers, meta) -> str:
         <h3>{esc(title)}</h3>
         <div class="facts">
           <div><b>{m.avg_rating:.1f}</b><span>audience rating</span></div>
-          <div><b>{m.runtime:.0f}</b><span>minutes</span></div>
-          <div><b>{m.year:.0f}</b><span>released around</span></div>
+          <div><b>{na(m.runtime)}</b><span>minutes</span></div>
+          <div><b>{na(m.year)}</b><span>released around</span></div>
         </div>
-        <div class="pred"><div class="pn">{score:.1f}</div><div class="pl">predicted rating for you</div></div>
-        <div class="gauge"><i style="width:{pct(score, 10)}%"></i></div>
+        <div class="pred"><div class="pn">{score:.1f}</div><div class="pl">predicted rating for you (out of {scale:g})</div></div>
+        <div class="gauge"><i style="width:{pct(score, 100 / scale)}%"></i></div>
         <p class="why">Recommended by {int(backers)} of your {TOP_USERS} taste twins.</p>
       </div>
     </div>""")
 
 
-def shelf_html(rows, meta) -> str:
+def shelf_html(rows, scale) -> str:
     cards = ""
     for rank, title, score, backers in rows:
         cards += f"""
         <div class="pcard">
           {poster_html(title, title, ROMAN[rank - 1])}
           <div class="pn">{score:.1f}<small>predicted</small></div>
-          <div class="gauge"><i style="width:{pct(score, 10)}%"></i></div>
+          <div class="gauge"><i style="width:{pct(score, 100 / scale)}%"></i></div>
           <p class="why">{int(backers)} of {TOP_USERS} taste twins recommend it.</p>
         </div>"""
     return flat(f'<div class="shelf">{cards}</div>')
@@ -338,11 +401,13 @@ def twins_html(twins) -> str:
     return flat(f'<div class="credits">{rows}</div>')
 
 
-def genre_bars_html(uid, df) -> str:
+def genre_bars_html(uid, df, scale) -> str:
     g = df[df[USER] == uid].groupby(GENRE)[RATING].mean().sort_values(ascending=False)
+    if g.empty or set(g.index) == {"Unknown"}:
+        return flat('<div class="empty">This dataset has no genre column.</div>')
     rows = "".join(
         f'<div class="gbar"><span class="nm">{esc(name)}</span>'
-        f'<div class="t"><i style="width:{pct(val, 10)}%"></i></div><em>{val:.1f}</em></div>'
+        f'<div class="t"><i style="width:{pct(val, 100 / scale)}%"></i></div><em>{val:.1f}</em></div>'
         for name, val in g.items()
     )
     return flat(f"<div>{rows}</div>")
@@ -352,41 +417,80 @@ def genre_bars_html(uid, df) -> str:
 # 5. Streamlit page
 # --------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load(path_or_bytes):
-    src = io.BytesIO(path_or_bytes) if isinstance(path_or_bytes, bytes) else path_or_bytes
-    return prepare(src)
+def cached_raw(src, filename, sheet):
+    return read_raw(src, filename, sheet)
+
+
+@st.cache_data(show_spinner=False)
+def cached_sheets(data: bytes):
+    return pd.ExcelFile(io.BytesIO(data)).sheet_names
+
+
+@st.cache_data(show_spinner=False)
+def cached_prepare(raw, mapping_items):
+    return prepare(raw, dict(mapping_items))
+
+
+def sidebar_dataset():
+    """Returns (raw_dataframe, mapping) for the sample file or an uploaded one."""
+    with st.sidebar:
+        st.markdown("**Dataset**")
+        uploaded = st.file_uploader("Test another Excel or CSV file", type=["xlsx", "csv"])
+
+        if uploaded is None:
+            st.caption("Using the sample dataset.")
+            if not Path(DATA_PATH).exists():
+                return None, f"Could not find {DATA_PATH}. Put the Excel file there, or upload one in the sidebar."
+            raw = cached_raw(DATA_PATH, DATA_PATH, SHEET)
+            return raw, {c: c for c in REQUIRED + OPTIONAL}
+
+        data, name = uploaded.getvalue(), uploaded.name
+        sheet = None
+        if not name.lower().endswith(".csv"):
+            sheets = cached_sheets(data)
+            default = sheets.index(SHEET) if SHEET in sheets else 0
+            sheet = st.selectbox("Sheet", sheets, index=default, key=f"sheet_{name}") if len(sheets) > 1 else sheets[0]
+        raw = cached_raw(data, name, sheet)
+
+        st.markdown("**Match your columns**")
+        cols = list(raw.columns)
+        mapping = {}
+        for canon in REQUIRED + OPTIONAL:
+            guess = guess_column(cols, canon)
+            options = cols if canon in REQUIRED else ["(none)"] + cols
+            index = options.index(guess) if guess in options else 0
+            pick = st.selectbox(LABELS[canon], options, index=index, key=f"map_{canon}_{name}_{sheet}")
+            mapping[canon] = None if pick == "(none)" else pick
+        return raw, mapping
 
 
 def main():
     st.set_page_config(page_title="Reel Match", page_icon="🎞️", layout="wide")
     st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+    st.markdown(masthead_html(), unsafe_allow_html=True)      # always shown, even if the data fails
 
-    with st.sidebar:
-        st.markdown("**Dataset**")
-        uploaded = st.file_uploader("Test another Excel file", type=["xlsx"])
-        st.caption("Column names are set at the top of app.py.")
+    try:
+        raw, mapping = sidebar_dataset()
+    except Exception as exc:
+        st.error(f"Could not open that file: {exc}")
+        st.stop()
+    if raw is None:
+        st.error(mapping)
+        st.stop()
 
-    if uploaded is not None:
-        source = uploaded.getvalue()
-    elif Path(DATA_PATH).exists():
-        source = DATA_PATH
-    else:
-        st.markdown(masthead_html(), unsafe_allow_html=True)
-        st.error(f"Could not find {DATA_PATH}. Put the Excel file there, or upload it in the sidebar.")
+    if len({mapping[c] for c in REQUIRED}) < len(REQUIRED) or any(mapping[c] is None for c in REQUIRED):
+        st.warning("Pick three different columns in the sidebar for user ID, movie title and rating.")
         st.stop()
 
     try:
-        df, matrix, sim_df, meta = load(source)
-    except Exception as exc:  # wrong sheet / wrong column names / missing package
-        st.markdown(masthead_html(), unsafe_allow_html=True)
-        st.error(f"Could not read the data: {exc}. Check SHEET and the column names at the top of app.py.")
+        df, matrix, sim_df, meta, scale = cached_prepare(raw, tuple(mapping.items()))
+    except Exception as exc:
+        st.error(f"This dataset could not be used: {exc}")
         st.stop()
 
-    ids = [int(i) for i in matrix.index]
+    ids = matrix.index.tolist()
     if st.session_state.get("uid") not in ids:
         st.session_state["uid"] = ids[0]
-
-    st.markdown(masthead_html(), unsafe_allow_html=True)
 
     def surprise():
         st.session_state["uid"] = random.choice(ids)
@@ -409,19 +513,19 @@ def main():
                     'Choose another viewer.</div>', unsafe_allow_html=True)
     else:
         first = recs.iloc[0]
-        st.markdown(feature_html(recs.index[0], first.score, first.backers, meta), unsafe_allow_html=True)
+        st.markdown(feature_html(recs.index[0], first.score, first.backers, meta, scale), unsafe_allow_html=True)
         rest = [(i + 2, t, r.score, r.backers) for i, (t, r) in enumerate(recs.iloc[1:].iterrows())]
         if rest:
-            st.markdown(shelf_html(rest, meta), unsafe_allow_html=True)
+            st.markdown(shelf_html(rest, scale), unsafe_allow_html=True)
 
     st.markdown(sec_html("Viewers who share their taste",
-                         "The five viewers whose ratings are closest to this one, by cosine similarity."),
+                         f"The {len(twins)} viewers whose ratings are closest to this one, by cosine similarity."),
                 unsafe_allow_html=True)
     st.markdown(twins_html(twins), unsafe_allow_html=True)
 
     st.markdown(sec_html("What this viewer rates highest", "Average rating given, by genre."),
                 unsafe_allow_html=True)
-    st.markdown(genre_bars_html(uid, df), unsafe_allow_html=True)
+    st.markdown(genre_bars_html(uid, df, scale), unsafe_allow_html=True)
 
     st.write("")
     with st.expander("How the picks are made"):
